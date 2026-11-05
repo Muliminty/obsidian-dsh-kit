@@ -7,7 +7,7 @@ const fixtureRoot = await realpath(await mkdtemp(path.join(tmpdir(), 'obsidian-d
 await mkdir(path.join(fixtureRoot, '10_日记'));
 after(() => rm(fixtureRoot, { recursive: true, force: true }));
 import { today, inspectWater, recordWater, newDiary, audit, WATER_SECTION } from './water.js';
-import { apply } from './index.js';
+import { apply, verifyWrite } from './index.js';
 import { Readable } from 'node:stream';
 import vm from 'node:vm';
 test('OrbitOS 首页单卡入口、子页面与返回导航', async () => {
@@ -25,7 +25,17 @@ test('OrbitOS 首页单卡入口、子页面与返回导航', async () => {
     useState: initial => hookIndex++ === 0 ? [active, value => { active = value; }] : [initial, () => {}], useRef: value => ({ current: value }),
     useEffect() {}, useSyncExternalStore() {},
   };
-  vm.runInNewContext(source, { window: { __ModuleLoader__: { load: value => { definition = value; } } } });
+  const requests = [];
+  let failWrite = false;
+  vm.runInNewContext(source, {
+    window: { confirm: () => true, __ModuleLoader__: { load: value => { definition = value; } } },
+    URL, document: { baseURI: 'http://localhost/' }, AbortSignal,
+    crypto: { randomUUID: () => 'test-client-12345' },
+    fetch: async (url, options) => {
+      if (options.body) { requests.push(JSON.parse(options.body)); if (failWrite) throw Error('connection lost'); }
+      return { ok: true, headers: { get: () => 'application/json' }, json: async () => ({ kind: 'ready', count: 4, date: '2026-11-05', version: 'test', total: 3280, capacity: 820 }) };
+    },
+  });
   let entry;
   const ctx = {
     effect: f => f(),
@@ -36,10 +46,27 @@ test('OrbitOS 首页单卡入口、子页面与返回导航', async () => {
   assert.equal(entry.label(), 'Obsidian DSH Kit');
   const cards = nodes.filter(node => node.type === 'button' && node.props.className.includes('os-feature'));
   assert.equal(cards.length, 1);
-  assert.ok(!nodes.some(node => node.type === 'button' && node.children.includes('喝了一杯（+1）')));
+  assert.ok(!nodes.some(node => node.type === 'button' && node.children.includes('喝了一杯')));
   cards[0].props.onClick();
   nodes.length = 0; hookIndex = 0; Page();
-  assert.ok(nodes.some(node => node.type === 'button' && node.children.includes('喝了一杯（+1）')));
+  assert.ok(nodes.some(node => node.type === 'button' && node.children.includes('喝了一杯')));
+  for (const [label, delta] of [['喝了一杯', 1], ['喝了半杯', 0.5], ['减少半杯', -0.5], ['减少一杯', -1]]) {
+    const button = nodes.find(node => node.type === 'button' && node.children.includes(label));
+    assert.ok(button, label);
+    await button.props.onClick();
+    assert.equal(requests.at(-1).delta, delta);
+  }
+  assert.ok(nodes.some(node => node.type === 'details'));
+  const add = nodes.find(node => node.type === 'button' && node.children.includes('喝了一杯'));
+  failWrite = true;
+  await add.props.onClick();
+  const attempts = requests.length;
+  await add.props.onClick();
+  assert.equal(requests.length, attempts, '结果不确定时不得再次提交');
+  await nodes.find(node => node.type === 'button' && node.children.includes('核对日记')).props.onClick();
+  failWrite = false;
+  await add.props.onClick();
+  assert.equal(requests.length, attempts + 1, '核对成功后恢复操作');
   const back = nodes.find(node => node.type === 'button' && node.children.includes('返回功能首页'));
   back.props.onClick();
   assert.equal(active, null);
@@ -79,6 +106,38 @@ test('空记录与逐杯累加，其他正文不变', () => {
   assert.equal(inspectWater(text).total, 3280);
   assert.equal(text.replace('**喝水打卡**：1111', '**喝水打卡**：'), diary);
 });
+test('分数杯增减、归并、容量计算及其他正文保护', () => {
+  let text = diary;
+  for (const [delta, count] of [[1, 1], [0.5, 1.5], [0.25, 1.75], [-0.25, 1.5], [-0.5, 1], [-1, 0]]) {
+    const result = recordWater(text, { delta });
+    assert.equal(result.count, count);
+    assert.equal(result.total, count * 820);
+    text = result.text;
+    assert.equal(text.replace(/(\*\*喝水打卡\*\*：)[^\r\n]*/, '$1'), diary);
+  }
+  assert.equal(text, diary);
+  const fraction = recordWater(recordWater(diary, { delta: 0.5 }).text, { delta: 0.25 });
+  assert.ok(fraction.text.includes('**喝水打卡**：½¼'));
+  assert.equal(fraction.total, 615);
+  assert.equal(recordWater(fraction.text, { delta: 0.25 }).count, 1);
+});
+test('拒绝不足扣减、无记录扣减与非法增量', () => {
+  for (const delta of [-1, -0.5, -0.25]) assert.throws(() => recordWater(diary, { delta }), /不足/);
+  assert.throws(() => recordWater('## 日志\n', { delta: -0.25, createSection: true }), /不能扣减/);
+  for (const delta of [0, 0.1, 2, '0.5', null, NaN, Infinity]) assert.throws(() => recordWater(diary, { delta }), /无效/);
+  assert.equal(recordWater(recordWater(diary, { delta: 0.25 }).text, { delta: -0.25 }).count, 0);
+});
+test('接口拒绝非法增量，缺失记录扣减不触发创建', async () => {
+  const call = host();
+  for (const delta of [0, 0.1, 2, '0.5', null]) {
+    const result = await call('record', 'POST', { id: 'test-invalid-12345', delta });
+    assert.equal(result.status, 400);
+  }
+  const state = (await call('status', 'GET')).body;
+  const result = await call('record', 'POST', { id: 'test-minus-12345', delta: -0.25, date: state.date, version: state.version });
+  assert.equal(result.status, 400);
+  assert.match(result.body.message, /不能扣减/);
+});
 test('读取调整后的当天容量', () => {
   const value = recordWater(diary.replace('820 ml', '600 ml'));
   assert.equal(value.total, 600);
@@ -109,4 +168,11 @@ test('审计只更新 Frontmatter', () => {
   assert.ok(text.includes('last_operation_id: "test-water"'));
   assert.ok(text.endsWith(diary.slice(diary.indexOf('\n---', 4))));
   assert.throws(() => audit('普通文本', 'test'));
+});
+
+test('写入结果以完整读回为准，不依赖回执文字', async () => {
+  await verifyWrite(async () => 'unexpected output', async () => 'expected', 'expected');
+  await verifyWrite(async () => { throw Error('timeout after commit'); }, async () => 'expected', 'expected');
+  await assert.rejects(verifyWrite(async () => 'orbitos-water-ok', async () => 'old', 'expected'), /尚不确定/);
+  await assert.rejects(verifyWrite(async () => { throw Error('failed'); }, async () => { throw Error('unreadable'); }, 'expected'), /尚不确定/);
 });

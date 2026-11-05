@@ -1,5 +1,5 @@
 // 喝水记录的纯文本变换；不执行文件读写。
-export const WATER_SECTION = `## 喝水记录\n\n- **每杯容量**：约 820 ml（可调整；历史日记保留当天容量）\n- **喝水打卡**：\n\n<!-- 每喝完一杯追加一个 1；留空表示尚未记录。 -->\n\n`;
+export const WATER_SECTION = `## 喝水记录\n\n- **每杯容量**：约 820 ml（可调整；历史日记保留当天容量）\n- **喝水打卡**：\n\n<!-- 1 = 一杯，½ = 半杯，¼ = 四分之一杯；留空表示尚未记录。 -->\n\n`;
 export function today(now = new Date()) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
 }
@@ -15,21 +15,27 @@ export function inspectWater(text) {
   const marks = [...section.matchAll(/^- \*\*喝水打卡\*\*[：:]([^\r\n]*)/gm)];
   if (marks.length !== 1) throw new Error('喝水打卡行缺失或重复，请检查记录格式，未修改日记。');
   const raw = marks[0][1].trim();
-  if (!/^1*$/.test(raw)) throw new Error('喝水打卡行含有非 1 内容，请先检查，未修改日记。');
+  if (!/^[1½¼]*$/.test(raw)) throw new Error('喝水打卡行含有无法识别的内容，仅支持 1、½、¼，请先检查，未修改日记。');
+  const quarters = [...raw].reduce((sum, mark) => sum + ({ '1': 4, '½': 2, '¼': 1 }[mark]), 0);
   const capacity = section.match(/^- \*\*每杯容量\*\*[：:]\s*(?:约\s*)?(\d+(?:\.\d+)?)\s*ml\b/im);
   const ml = capacity ? Number(capacity[1]) : null;
   if (!ml || !Number.isFinite(ml)) throw new Error('无法识别每杯容量，请填写正数 ml，未修改日记。');
-  return { kind: 'ready', count: raw.length, capacity: ml, total: raw.length * ml, lineStart: start + marks[0].index, lineLength: marks[0][0].length };
+  return { kind: 'ready', count: quarters / 4, capacity: ml, total: quarters / 4 * ml, lineStart: start + marks[0].index, lineLength: marks[0][0].length };
 }
-export function recordWater(text, { createSection = false } = {}) {
+export function recordWater(text, { createSection = false, delta = 1 } = {}) {
+  if (![1, 0.5, 0.25, -0.25, -0.5, -1].includes(delta)) throw new Error('无效杯数调整。');
   let state = inspectWater(text);
   if (state.kind === 'missing-section') {
+    if (delta < 0) throw new Error('尚无喝水记录，不能扣减。');
     if (!createSection) return { kind: 'missing-section' };
     const at = text.search(/^## 日志\s*$/m);
     text = at >= 0 ? text.slice(0, at) + WATER_SECTION + text.slice(at) : text.trimEnd() + '\n\n' + WATER_SECTION;
     state = inspectWater(text);
   }
-  const line = `- **喝水打卡**：${'1'.repeat(state.count + 1)}`;
+  const quarters = state.count * 4 + delta * 4;
+  if (quarters < 0) throw new Error('剩余杯数不足，不能扣减至零以下。');
+  const marks = '1'.repeat(Math.floor(quarters / 4)) + (quarters % 4 >= 2 ? '½' : '') + (quarters % 2 ? '¼' : '');
+  const line = `- **喝水打卡**：${marks}`;
   const next = text.slice(0, state.lineStart) + line + text.slice(state.lineStart + state.lineLength);
   return { kind: 'recorded', text: next, ...inspectWater(next) };
 }

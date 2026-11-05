@@ -20,6 +20,17 @@ async function obsidianEval(code, timeout) {
   const { stdout } = await run(OBSIDIAN_BIN, ['eval', `code=${code}`], { timeout, maxBuffer: 1024 * 1024 });
   return stdout.replace(/^=>\s?/, '').trim();
 }
+/** CLI 返回文字不是提交凭据；只认目标文件的完整读回。异常后也核对，避免已写入误报。 */
+export async function verifyWrite(write, readBack, expected, log = () => {}) {
+  try { const output = await write(); log('CLI 返回', output); }
+  catch (error) { log('CLI 异常', { code: error.code, killed: error.killed, stdout: error.stdout, stderr: error.stderr }); }
+  try {
+    const actual = await readBack();
+    log('读回校验', { matched: actual === expected, expectedHash: hash(expected), actualHash: hash(actual), expectedBytes: Buffer.byteLength(expected), actualBytes: Buffer.byteLength(actual) });
+    if (actual === expected) return;
+  } catch (error) { log('读回异常', { code: error.code }); }
+  throw new Error('写入结果尚不确定，请刷新核对日记后再操作，勿重复点击。');
+}
 export function apply(ctx, config = {}) {
   const settings = {
     vaultRoot: config.vaultRoot,
@@ -68,6 +79,12 @@ export function apply(ctx, config = {}) {
       const rejection = ctx.connection.requestRejection(req);
       if (rejection !== undefined) { res.statusCode = rejection; res.end(); return; }
       if (req.method !== (action === 'status' ? 'GET' : 'POST')) { res.statusCode = 405; res.end(); return; }
+      const diagnostics = [];
+      const log = (stage, detail) => {
+        // 不记录执行代码、日记正文、命令参数或凭据，仅保留短回执与结构化状态。
+        const clean = value => typeof value === 'string' ? value.split('\n').filter(line => line.length <= 400 && !line.includes('code=')).join('\n').slice(0, 800) : value;
+        diagnostics.push({ time: new Date().toISOString(), stage, detail: typeof detail === 'object' && detail !== null ? Object.fromEntries(Object.entries(detail).map(([k, v]) => [k, clean(v)])) : clean(detail) });
+      };
       try {
         if (action === 'status') { const { text, ...state } = await snapshot(); json(res, 200, state); return; }
         if (String(req.headers['content-type']).split(';')[0] !== 'application/json') { json(res, 415, { message: '需要 JSON 请求。' }); return; }
@@ -75,10 +92,14 @@ export function apply(ctx, config = {}) {
         for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > 4096) throw new Error('请求过大。'); }
         const input = JSON.parse(body);
         if (typeof input.id !== 'string' || !/^[a-zA-Z0-9-]{8,80}$/.test(input.id)) throw new Error('无效请求标识。');
+        const delta = input.delta === undefined ? 1 : input.delta;
+        if (![1, 0.5, 0.25, -0.25, -0.5, -1].includes(delta)) throw new Error('无效杯数调整。');
         const execute = async () => {
           if (completed.has(input.id)) return completed.get(input.id);
           const current = await snapshot();
+          log('写入前', { requestId: input.id, delta, date: current.date, kind: current.kind, count: current.count, version: current.version });
           if (input.date !== current.date || input.version !== current.version) return { conflict: true, message: '日期或日记内容已变化，请刷新后重试。' };
+          if (delta < 0 && current.kind !== 'ready') throw new Error('尚无喝水记录，不能扣减。');
           if (current.kind !== 'ready' && input.confirm !== current.kind) return { confirmation: current.kind };
           let text = current.text;
           if (text === undefined) {
@@ -86,17 +107,16 @@ export function apply(ctx, config = {}) {
             const template = await readFile(await safe(root, settings.templatePath), 'utf8');
             text = newDiary(template, current.date);
           }
-          const updated = recordWater(text, { createSection: true });
+          const updated = recordWater(text, { createSection: true, delta });
           const operation = `${current.date.replaceAll('-', '')}-${Date.now()}-${settings.operationSuffix}`;
           const next = audit(updated.text, operation);
           // Obsidian 的 process 在实际提交时再次比较原文，避免覆盖同时编辑的内容。
-          const code = `(async()=>{if(app.vault.adapter.getBasePath()!==${JSON.stringify(await vaultRoot())})throw Error('Obsidian 当前仓库不匹配');const p=${JSON.stringify(current.path)};const f=app.vault.getAbstractFileByPath(p);const expected=${JSON.stringify(current.text ?? null)};const next=${JSON.stringify(next)};if(expected===null){if(f)throw Error('日记已由其他操作创建，请刷新');await app.vault.create(p,next)}else{if(!f)throw Error('日记已被移除，请刷新');await app.vault.process(f,s=>{if(s!==expected)throw Error('日记已修改，请刷新');return next})}return 'orbitos-water-ok'})()`;
-          let marker;
-          try { marker = await obsidianEval(code, 20000); }
-          catch (error) { throw new Error(`Obsidian 写入未确认：${String(error.message).slice(0, 300)}`); }
-          if (marker !== 'orbitos-water-ok') throw new Error('Obsidian 未确认写入，请刷新核对后再操作。');
+          const code = `(async()=>{if(app.vault.adapter.getBasePath()!==${JSON.stringify(await vaultRoot())})throw Error('Obsidian 当前仓库不匹配');const p=${JSON.stringify(current.path)};const f=app.vault.getAbstractFileByPath(p);const decode=b=>new TextDecoder().decode(Uint8Array.from(atob(b),c=>c.charCodeAt(0)));const expected=${current.text === undefined ? 'null' : `decode('${Buffer.from(current.text, 'utf8').toString('base64')}')`};const next=decode('${Buffer.from(next, 'utf8').toString('base64')}');if(expected===null){if(f)throw Error('日记已由其他操作创建，请刷新');await app.vault.create(p,next)}else{if(!f)throw Error('日记已被移除，请刷新');await app.vault.process(f,s=>{if(s!==expected)throw Error('日记已修改，请刷新');return next})}return 'orbitos-water-ok'})()`;
+          const target = await safe(await vaultRoot(), current.path);
+          await verifyWrite(() => obsidianEval(code, 20000), () => readFile(target, 'utf8'), next, log);
           const { text: ignored, ...state } = await snapshot();
-          const result = { ...state, recorded: true };
+          log('写入完成', { count: state.count, total: state.total });
+          const result = { ...state, recorded: true, diagnostics };
           completed.set(input.id, result);
           if (completed.size > 500) completed.delete(completed.keys().next().value);
           return result;
@@ -104,7 +124,7 @@ export function apply(ctx, config = {}) {
         const pending = queue.then(execute);
         queue = pending.catch(() => {});
         json(res, 200, await pending);
-      } catch (error) { json(res, 400, { message: error.message || '记录失败，请刷新后核对。' }); }
+      } catch (error) { json(res, 400, { message: error.message || '记录失败，请刷新后核对。', diagnostics }); }
     },
   }));
 }

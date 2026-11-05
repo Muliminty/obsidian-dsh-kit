@@ -1,6 +1,6 @@
 {
   "name": "obsidian-dsh-kit",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "description": "Obsidian DSH Kit：面向 DeepSeek Harness 的模块化个人工具插件，首个模块「喝水打卡」一键记录饮水并保存到 Obsidian 当日日记。",
   "scripts": { "test": "node --test water.test.js" },
