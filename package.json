@@ -1,0 +1,25 @@
+{
+  "name": "obsidian-dsh-kit",
+  "version": "1.2.0",
+  "private": true,
+  "description": "Obsidian DSH Kit：面向 DeepSeek Harness 的模块化个人工具插件，首个模块「喝水打卡」一键记录饮水并保存到 Obsidian 当日日记。",
+  "scripts": { "test": "node --test water.test.js" },
+  "type": "module",
+  "keywords": ["dsh", "deepseek-harness", "obsidian", "water", "habit", "plugin"],
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "water.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-ui-sidebar-right", "@deepseek-ai/dsh-client-ui-sidebar-browser"]
+    }
+  }
+}

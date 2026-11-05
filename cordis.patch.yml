@@ -1,0 +1,7 @@
+# config.vaultRoot：Obsidian 仓库绝对路径；留空时自动读取正在运行的 Obsidian 当前仓库。
+# config.diaryDir：日记目录（默认 10_日记）。
+# config.templatePath：新建日记所用模板（默认 99_系统/模板/Daily_Note.md）。
+- insert:
+    - id: obsidian-dsh-kit
+      name: 'obsidian-dsh-kit'
+      config: {}
